@@ -314,7 +314,7 @@ http.createServer((req, res) => {
 <style>
 body{margin:0;background:#111;font-family:Segoe UI,Tahoma,sans-serif}
 #panel{position:fixed;top:20px;left:20px;width:240px;background:#222;border-radius:12px;color:#fff;overflow:hidden}
-#header{background:#0072ff;padding:8px;font-weight:bold;text-align:center;cursor:move}
+#header{background:#0072ff;padding:8px;font-weight:bold;text-align:center;cursor:move;user-select:none}
 #content{padding:10px}
 .stat{margin-bottom:6px;padding:6px;background:rgba(255,255,255,0.05);border-radius:6px;font-size:13px}
 </style>
@@ -330,7 +330,42 @@ body{margin:0;background:#111;font-family:Segoe UI,Tahoma,sans-serif}
 <div class="stat" id="inactive"></div>
 </div>
 </div>
+
 <script>
+const panel = document.getElementById("panel");
+const header = document.getElementById("header");
+
+let dragging = false;
+let offsetX = 0;
+let offsetY = 0;
+
+const savedX = localStorage.getItem("panelX");
+const savedY = localStorage.getItem("panelY");
+
+if (savedX && savedY) {
+    panel.style.left = savedX + "px";
+    panel.style.top = savedY + "px";
+}
+
+header.onmousedown = (e) => {
+    dragging = true;
+    offsetX = e.clientX - panel.offsetLeft;
+    offsetY = e.clientY - panel.offsetTop;
+    e.preventDefault();
+};
+
+window.onmousemove = (e) => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - offsetX) + "px";
+    panel.style.top = (e.clientY - offsetY) + "px";
+};
+
+window.onmouseup = () => {
+    dragging = false;
+    localStorage.setItem("panelX", panel.offsetLeft);
+    localStorage.setItem("panelY", panel.offsetTop);
+};
+
 async function update(){
 try{
 const r=await fetch('/stats');
@@ -345,6 +380,7 @@ inactive.textContent="Inactive: "+Math.floor(d.inactiveFor/1000)+"s";
 setInterval(update,1000);
 update();
 </script>
+
 </body>
 </html>`);
 }).listen(PORT);
