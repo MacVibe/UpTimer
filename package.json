@@ -1,12 +1,16 @@
 {
   "name": "ws-bot",
   "version": "1.0.0",
+  "description": "WebSocket bot controller",
   "main": "script.js",
   "scripts": {
     "start": "node script.js"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
-    "ws": "^8.0.0"
+    "ws": "8.18.0"
   },
   "license": "MIT"
 }
