@@ -32,6 +32,9 @@ const bots = new Set();
 let connectingSockets = 0;
 let totalQueuedMessages = 0;
 let lastActivity = Date.now();
+let inactivityStart = null;
+
+const INACTIVITY_THRESHOLD = 15000;
 
 function safeSend(ws, data, force = false) {
     if (ws.readyState !== WebSocket.OPEN) return false;
@@ -224,6 +227,16 @@ init();
 process.on("uncaughtException", () => {});
 process.on("unhandledRejection", () => {});
 
+setInterval(() => {
+    const now = Date.now();
+    const inactive = now - lastActivity > INACTIVITY_THRESHOLD;
+    if (inactive) {
+        if (!inactivityStart) inactivityStart = now;
+    } else {
+        inactivityStart = null;
+    }
+}, 1000);
+
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
@@ -233,7 +246,8 @@ http.createServer((req, res) => {
             activeSockets: bots.size,
             connectingSockets,
             queuedMessages: totalQueuedMessages,
-            uptime: process.uptime()
+            uptime: process.uptime(),
+            inactiveFor: inactivityStart ? Date.now() - inactivityStart : 0
         }));
         return;
     }
@@ -254,6 +268,7 @@ http.createServer((req, res) => {
             <div class="box">Connecting sockets: ${connectingSockets}</div>
             <div class="box">Queued messages: ${totalQueuedMessages}</div>
             <div class="box">Uptime: ${Math.floor(process.uptime())}s</div>
+            <div class="box">Inactive for: ${inactivityStart ? Math.floor((Date.now() - inactivityStart)/1000) + "s" : "0s"}</div>
         </body>
         </html>
     `);
