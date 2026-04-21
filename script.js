@@ -79,11 +79,19 @@ function clearBotIntervals(bot) {
 function destroyBot(bot) {
     if (bot.destroyed) return;
     bot.destroyed = true;
+
+    if (bot.connecting) {
+        bot.connecting = false;
+        connectingSockets = Math.max(0, connectingSockets - 1);
+    }
+
     clearBotIntervals(bot);
+
     try {
         bot.ws.removeAllListeners();
         bot.ws.terminate();
     } catch {}
+
     bots.delete(bot);
 }
 
@@ -91,7 +99,11 @@ function attachBotHandlers(bot) {
     const ws = bot.ws;
 
     ws.on("open", () => {
-        connectingSockets--;
+        if (bot.connecting) {
+            bot.connecting = false;
+            connectingSockets = Math.max(0, connectingSockets - 1);
+        }
+
         lastActivity = Date.now();
         SERVER_ONLINE = true;
         clearBotIntervals(bot);
@@ -144,25 +156,46 @@ function attachBotHandlers(bot) {
 
 function createBot() {
     connectingSockets++;
+
     const bot = {
         ws: new WebSocket(WS_URL),
         joined: false,
         destroyed: false,
         intervals: [],
-        hbIndex: 0
+        hbIndex: 0,
+        connecting: true
     };
+
     attachBotHandlers(bot);
     bots.add(bot);
 }
 
 function ensureBotCount() {
     if (!SERVER_ONLINE) return;
-    while (bots.size < TARGET_BOT_COUNT) createBot();
-    if (bots.size > TARGET_BOT_COUNT) {
-        let excess = bots.size - TARGET_BOT_COUNT;
-        for (const bot of Array.from(bots)) {
-            if (excess-- <= 0) break;
-            destroyBot(bot);
+
+    let total = bots.size + connectingSockets;
+
+    while (total < TARGET_BOT_COUNT) {
+        createBot();
+        total++;
+    }
+
+    if (total > TARGET_BOT_COUNT) {
+        let excess = total - TARGET_BOT_COUNT;
+
+        for (const bot of bots) {
+            if (excess <= 0) break;
+            if (bot.connecting) {
+                destroyBot(bot);
+                excess--;
+            }
+        }
+
+        if (excess > 0) {
+            for (const bot of bots) {
+                if (excess-- <= 0) break;
+                destroyBot(bot);
+            }
         }
     }
 }
