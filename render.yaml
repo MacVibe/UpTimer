@@ -2,5 +2,13 @@ services:
   - type: web
     name: ws-bot
     runtime: node
+
     buildCommand: npm install
     startCommand: node script.js
+
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+
+      - key: NODE_OPTIONS
+        value: --no-deprecation
