@@ -1,23 +1,11 @@
-# dependencies
 node_modules/
-
-# environment variables
 .env
 .env.*
 
-# logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
 
-# OS files
 .DS_Store
-Thumbs.db
-
-# editor / IDE
 .vscode/
 .idea/
-
-# optional: ignore local test files
-*.local.js
