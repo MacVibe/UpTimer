@@ -293,24 +293,125 @@ http.createServer((req, res) => {
 
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(`
-        <html>
-        <head>
-            <meta http-equiv="refresh" content="2">
-            <style>
-                body { font-family: Arial; background:#111; color:#0f0; padding:20px; }
-                .box { margin:10px 0; font-size:20px; }
-            </style>
-        </head>
-        <body>
-            <h1>Bot Dashboard</h1>
-            <div class="box">Connected: ${bots.size - connectingSockets}</div>
-            <div class="box">Connecting: ${connectingSockets}</div>
-            <div class="box">Total: ${bots.size}</div>
-            <div class="box">Queued: ${totalQueuedMessages}</div>
-            <div class="box">Uptime: ${Math.floor(process.uptime())}s</div>
-            <div class="box">Inactive: ${inactivityStart ? Math.floor((Date.now() - inactivityStart)/1000)+"s":"0s"}</div>
-        </body>
-        </html>
+<html>
+<head>
+<style>
+body {
+    margin: 0;
+    background: #111;
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+}
+
+#panel {
+    position: fixed;
+    top: 20px;
+    left: 20px;
+    width: 240px;
+    background: linear-gradient(145deg, #1f1f1f, #282828);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+    color: #f5f5f5;
+    overflow: hidden;
+    user-select: none;
+}
+
+#header {
+    background: linear-gradient(to right, #00c6ff, #0072ff);
+    padding: 8px;
+    font-weight: bold;
+    text-align: center;
+    font-size: 14px;
+    cursor: move;
+}
+
+#content {
+    padding: 10px;
+}
+
+.stat {
+    margin-bottom: 6px;
+    padding: 6px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 6px;
+    font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="panel">
+    <div id="header">Script Status</div>
+    <div id="content">
+        <div class="stat" id="uptime">UpTime: 0</div>
+        <div class="stat" id="connected">Connected: 0</div>
+        <div class="stat" id="connecting">Connecting: 0</div>
+        <div class="stat" id="queued">Queued Messages: 0</div>
+        <div class="stat" id="inactive">Inactive: 0</div>
+    </div>
+</div>
+
+<script>
+const panel = document.getElementById('panel');
+const header = document.getElementById('header');
+
+let dragging = false, offsetX = 0, offsetY = 0;
+
+const savedX = localStorage.getItem("panelX");
+const savedY = localStorage.getItem("panelY");
+
+if (savedX && savedY) {
+    panel.style.left = savedX + "px";
+    panel.style.top = savedY + "px";
+}
+
+header.onmousedown = e => {
+    dragging = true;
+    offsetX = e.clientX - panel.offsetLeft;
+    offsetY = e.clientY - panel.offsetTop;
+};
+
+document.onmousemove = e => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - offsetX) + 'px';
+    panel.style.top = (e.clientY - offsetY) + 'px';
+};
+
+document.onmouseup = () => {
+    dragging = false;
+    localStorage.setItem("panelX", panel.offsetLeft);
+    localStorage.setItem("panelY", panel.offsetTop);
+};
+
+async function update() {
+    try {
+        const res = await fetch('/stats');
+        const data = await res.json();
+
+        document.getElementById('uptime').textContent =
+            "UpTime: " + Math.floor(data.uptime) + "s";
+
+        document.getElementById('connected').textContent =
+            "Connected: " + data.connected;
+
+        document.getElementById('connecting').textContent =
+            "Connecting: " + data.connecting;
+
+        document.getElementById('queued').textContent =
+            "Queued Messages: " + data.queuedMessages;
+
+        document.getElementById('inactive').textContent =
+            "Inactive: " + Math.floor(data.inactiveFor / 1000) + "s";
+
+    } catch {}
+}
+
+setInterval(update, 1000);
+update();
+</script>
+
+</body>
+</html>
     `);
 }).listen(PORT);
 
