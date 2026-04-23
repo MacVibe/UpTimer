@@ -19,29 +19,32 @@ let SERVER_ONLINE = true;
 
 const HEARTBEAT_INTERVAL = 5000;
 const TEAM_INTERVAL = 2000;
-const INFINITE_INTERVAL = 5;
 
 const MAX_BUFFER = 7200;
 const KILL_BUFFER = MAX_BUFFER * 10;
 
 const TEAM_CREATE_PACKET = Uint8Array.from([
-  49,33,47,116,101,97,109,32,99,114,101,97,116,101,32,84,101,115,116,101,114,115,32,103,51,56,57,56,101,110,97,107,108,49,48,
+  49, 33, 47, 116, 101, 97, 109, 32, 99, 114, 101, 97, 116, 101, 32, 84,
+  101, 115, 116, 101, 114, 115, 32, 103, 51, 56, 57, 56, 101, 110, 97, 107,
+  108, 49, 48,
 ]);
 
 const TEAM_JOIN_PACKET = Uint8Array.from([
-  49,31,47,116,101,97,109,32,106,111,105,110,32,84,101,115,116,101,114,115,32,103,51,56,57,56,101,110,97,107,108,49,48,
+  49, 31, 47, 116, 101, 97, 109, 32, 106, 111, 105, 110, 32, 84, 101, 115,
+  116, 101, 114, 115, 32, 103, 51, 56, 57, 56, 101, 110, 97, 107, 108, 49, 48,
 ]);
 
 const TEAM_JOINED_PACKET = Uint8Array.from([
-  24,0,0,12,84,101,97,109,32,106,111,105,110,101,100,33,4,103,111,111,100,
+  24, 0, 0, 12, 84, 101, 97, 109, 32, 106, 111, 105, 110, 101, 100, 33, 4,
+  103, 111, 111, 100,
 ]);
 
-const CHAT_JOIN_PACKET = Uint8Array.from([49,10,47,116,101,97,109,32,99,104,97,116]);
-const INFINITE_PACKET = Uint8Array.from([49,120,0]);
+const CHAT_JOIN_PACKET = Uint8Array.from([49, 10, 47, 116, 101, 97, 109, 32, 99, 104, 97, 116]);
+const INFINITE_PACKET = Uint8Array.from([49, 120, 0]);
 
 const HEARTBEATS = [
-  Uint8Array.from([34,0,0,0,0,0,64,128,0,192,195,166,192,0]),
-  Uint8Array.from([34,0,0,0,0,0,194,143,255,252,67,177,63,255]),
+  Uint8Array.from([34, 0, 0, 0, 0, 0, 64, 128, 0, 192, 195, 166, 192, 0]),
+  Uint8Array.from([34, 0, 0, 0, 0, 0, 194, 143, 255, 252, 67, 177, 63, 255]),
 ];
 
 const bots = new Set();
@@ -66,6 +69,27 @@ function safeSend(ws, data, force = false) {
   }
 }
 
+function buildPacket(...bytes) {
+  const randomNum = Math.floor(Math.random() * 10000);
+  const randomBytes = Array.from(String(randomNum)).map((c) =>
+    c.charCodeAt(0)
+  );
+  return Uint8Array.from([...bytes, ...randomBytes]);
+}
+
+function buildIntroPacket() {
+  return buildPacket(31, 1, 13, 240, 159, 148, 146, 13, 240, 159, 148, 145);
+}
+
+function isExactTeamJoined(data) {
+  const bytes = new Uint8Array(data);
+  if (bytes.length !== TEAM_JOINED_PACKET.length) return false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] !== TEAM_JOINED_PACKET[i]) return false;
+  }
+  return true;
+}
+
 function clearBotIntervals(bot) {
   for (const i of bot.intervals) clearInterval(i);
   bot.intervals.length = 0;
@@ -75,42 +99,16 @@ function clearBotIntervals(bot) {
 function destroyBot(bot) {
   if (!bot || bot.destroyed) return;
   bot.destroyed = true;
-
   if (bot.connecting) {
     bot.connecting = false;
     connectingSockets = Math.max(0, connectingSockets - 1);
   }
-
   clearBotIntervals(bot);
-
   try {
     bot.ws?.removeAllListeners();
     bot.ws?.terminate();
   } catch {}
-
   bots.delete(bot);
-}
-
-function startInfiniteIfNeeded(bot) {
-  if (CURRENT_MODE !== 1) return;
-  if (!bot.joined) return;
-  if (bot.infInterval) return;
-
-  bot.infInterval = setInterval(() => {
-    if (bot.destroyed) return;
-
-    const res = safeSend(bot.ws, INFINITE_PACKET, true);
-    if (res === "OVERFLOW") destroyBot(bot);
-  }, INFINITE_INTERVAL);
-
-  bot.intervals.push(bot.infInterval);
-}
-
-function stopInfinite(bot) {
-  if (bot.infInterval) {
-    clearInterval(bot.infInterval);
-    bot.infInterval = null;
-  }
 }
 
 function attachBotHandlers(bot) {
@@ -127,11 +125,12 @@ function attachBotHandlers(bot) {
 
     clearBotIntervals(bot);
 
+    bot.hbIndex = bot.hbIndex || 0;
+
     safeSend(ws, Uint8Array.from([48]));
-    safeSend(ws, Uint8Array.from([31,1,13]));
+    safeSend(ws, buildIntroPacket());
     safeSend(ws, TEAM_CREATE_PACKET, true);
 
-    // Heartbeats (kept separate)
     bot.intervals.push(
       setInterval(() => {
         if (bot.destroyed) return;
@@ -142,10 +141,8 @@ function attachBotHandlers(bot) {
       }, HEARTBEAT_INTERVAL)
     );
 
-    // Join attempts
     const joinInterval = setInterval(() => {
       if (bot.destroyed) return;
-
       if (!bot.joined && ws.readyState === WebSocket.OPEN) {
         const res = safeSend(ws, TEAM_JOIN_PACKET, true);
         if (res === "OVERFLOW") destroyBot(bot);
@@ -162,25 +159,24 @@ function attachBotHandlers(bot) {
 
     if (!bot.joined && isExactTeamJoined(data)) {
       bot.joined = true;
-
       safeSend(ws, CHAT_JOIN_PACKET, true);
 
-      // 🔥 START infinite ONLY AFTER FULL JOIN
-      startInfiniteIfNeeded(bot);
+      if (!bot.infInterval) {
+        bot.infInterval = setInterval(() => {
+          if (bot.destroyed) return;
+          if (CURRENT_MODE !== 1) return;
+
+          const res = safeSend(ws, INFINITE_PACKET, true);
+          if (res === "OVERFLOW") destroyBot(bot);
+        }, 5);
+
+        bot.intervals.push(bot.infInterval);
+      }
     }
   });
 
   ws.on("close", () => destroyBot(bot));
   ws.on("error", () => destroyBot(bot));
-}
-
-function isExactTeamJoined(data) {
-  const bytes = new Uint8Array(data);
-  if (bytes.length !== TEAM_JOINED_PACKET.length) return false;
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] !== TEAM_JOINED_PACKET[i]) return false;
-  }
-  return true;
 }
 
 function createBot() {
@@ -194,7 +190,6 @@ function createBot() {
     hbIndex: 0,
     connecting: true,
   };
-
   attachBotHandlers(bot);
   bots.add(bot);
 }
@@ -211,6 +206,7 @@ function ensureBotCount() {
 
   if (total > TARGET_BOT_COUNT) {
     let excess = total - TARGET_BOT_COUNT;
+
     for (const bot of [...bots]) {
       if (excess <= 0) break;
       destroyBot(bot);
@@ -221,18 +217,8 @@ function ensureBotCount() {
 
 function applyConfig(newMode, newAmount) {
   if (newMode === CURRENT_MODE && newAmount === TARGET_BOT_COUNT) return;
-
   CURRENT_MODE = newMode;
   TARGET_BOT_COUNT = newAmount;
-
-  for (const bot of bots) {
-    if (CURRENT_MODE === 1) {
-      startInfiniteIfNeeded(bot);
-    } else {
-      stopInfinite(bot);
-    }
-  }
-
   ensureBotCount();
 }
 
